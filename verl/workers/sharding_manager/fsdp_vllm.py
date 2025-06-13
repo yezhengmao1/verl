@@ -31,6 +31,8 @@ except ImportError:
 
 from dataclasses import asdict
 
+from vtimeline import TracePoint
+
 from verl import DataProto
 from verl.protocol import all_gather_data_proto
 from verl.third_party.vllm import LLM, vllm_version
@@ -99,6 +101,9 @@ class FSDPVLLMShardingManager(BaseShardingManager):
 
     @GPUMemoryLogger(role="fsdp vllm sharding_manager", logger=logger)
     def __enter__(self):
+        mem_tp = TracePoint("vllm-load-model", "FSDPWorker")
+        mem_tp.begin()
+
         def __collect_lora_params() -> OrderedDict:
             """
             collect lora params or full params if base model is not ready in vllm
@@ -151,12 +156,18 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         #
         # pytorch: https://pytorch.org/docs/stable/notes/cuda.html#memory-management
         # vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/device_allocator/cumem.py#L103
-        get_torch_device().empty_cache()
+        with TracePoint("empty-cache", "FSDPWorker"):
+            get_torch_device().empty_cache()
 
         log_gpu_memory_usage("Before state_dict() in sharding manager memory", logger=logger)
         if self.offload_param:
+            tp = TracePoint("load-model-to-gpu", "FSDPWorker")
+            tp.begin()
             load_fsdp_model_to_gpu(self.module)
+            tp.end()
 
+        tp = TracePoint("collect-params", "FSDPWorker")
+        tp.begin()
         peft_config = None
         peft_model = getattr(self.module, "_fsdp_wrapped_module", self.module)
         if hasattr(peft_model, "peft_config"):
@@ -165,9 +176,13 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         else:
             params = self.module.state_dict()
         log_gpu_memory_usage("After state_dict() in sharding manager memory", logger=logger)
+        tp.end()
 
         # Copy, not share memory
         load_format = "hf" if self.full_params else "dtensor"
+
+        tp = TracePoint("sync-model-weights", "FSDPWorker")
+        tp.begin()
 
         if vllm_version in (
             "0.5.4",
@@ -194,14 +209,20 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                 self.inference_engine.wake_up(tags=["kv_cache"])
 
         log_gpu_memory_usage("After del state_dict and empty_cache in sharding manager", logger=logger)
+        tp.end()
 
         # important: need to manually set the random states of each tp to be identical.
         if self.device_mesh is not None:
             self.torch_random_states = get_torch_device().get_rng_state()
             get_torch_device().set_rng_state(self.gen_random_states)
 
+        mem_tp.end()
+
     @GPUMemoryLogger(role="fsdp vllm sharding_manager", logger=logger)
     def __exit__(self, exc_type, exc_value, traceback):
+        mem_tp = TracePoint("vllm-offload-model", "FSDPWorker")
+        mem_tp.begin()
+
         # TODO(ZSL): check this
         if vllm_version in (
             "0.5.4",
@@ -220,6 +241,8 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         if self.device_mesh is not None:
             self.gen_random_states = get_torch_device().get_rng_state()
             get_torch_device().set_rng_state(self.torch_random_states)
+
+        mem_tp.end()
 
     @GPUMemoryLogger(role="fsdp vllm sharding_manager", logger=logger)
     def preprocess_data(self, data: DataProto) -> DataProto:

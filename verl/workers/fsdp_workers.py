@@ -32,6 +32,7 @@ from peft import LoraConfig, TaskType, get_peft_model
 from safetensors.torch import save_file
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from vtimeline import TracePoint, VLogger, vinit
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
@@ -102,9 +103,16 @@ class ActorRolloutRefWorker(Worker):
         self.config = config
         import torch.distributed
 
+        vinit()
+
+        tp = TracePoint(f"init-for-{role}", "FSDPWorker")
+        tp.begin()
+
         if not torch.distributed.is_initialized():
             rank = int(os.environ.get("RANK", 0))
             world_size = int(os.environ.get("WORLD_SIZE", 1))
+
+            VLogger.info(f"Init torch distributed env for {role}, rank is {rank} / {world_size}")
             torch.distributed.init_process_group(backend="cpu:gloo,cuda:nccl" if is_cuda_available else "cpu:gloo,npu:hccl", rank=rank, world_size=world_size)
 
         # build device mesh for FSDP
@@ -161,6 +169,8 @@ class ActorRolloutRefWorker(Worker):
         if self._is_ref and self.config.ref.log_prob_micro_batch_size is not None:
             self.config.ref.log_prob_micro_batch_size //= self.device_mesh.size() // self.ulysses_sequence_parallel_size
             self.config.ref.log_prob_micro_batch_size_per_gpu = self.config.ref.log_prob_micro_batch_size
+
+        tp.end()
 
     def _build_model_optimizer(
         self,
@@ -487,6 +497,9 @@ class ActorRolloutRefWorker(Worker):
 
         if self._is_actor or self._is_rollout:
             # we need the model for actor and rollout
+            tp = TracePoint("load-model-for-actor-and-rollout", "FSDPWorker")
+            tp.begin()
+
             if self._is_actor:
                 optim_config = self.config.actor.optim
                 fsdp_config = self.config.actor.fsdp_config
@@ -519,12 +532,23 @@ class ActorRolloutRefWorker(Worker):
                 self.actor_module = self.actor_module_fsdp._fsdp_wrapped_module
 
             if self._is_offload_param:
+                offload_tp = TracePoint("offload-param", "FSDPWorker")
+                offload_tp.begin()
                 offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+                offload_tp.end()
+
                 log_gpu_memory_usage("After offload actor model during init", logger=logger)
 
             if self._is_offload_optimizer:
+                offload_tp = TracePoint("offload-optimizer", "FSDPWorker")
+                offload_tp.begin()
                 offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+                offload_tp.end()
+
                 log_gpu_memory_usage("After offload actor optimizer during init", logger=logger)
+
+            tp.end()
+
         # load from checkpoint
         if self._is_actor:
             OmegaConf.set_struct(self.config.actor, True)
@@ -534,9 +558,15 @@ class ActorRolloutRefWorker(Worker):
             self.actor = DataParallelPPOActor(config=self.config.actor, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer)
 
         if self._is_rollout:
+            tp = TracePoint("build-rollout", "FSDPWorker")
+            tp.begin()
             self.rollout, self.rollout_sharding_manager = self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
+            tp.end()
 
         if self._is_ref:
+            tp = TracePoint("build-ref-optimizer", "FSDPWorker")
+            tp.begin()
+
             local_path = copy_to_local(self.config.model.path, use_shm=use_shm)
             self.ref_module_fsdp = self._build_model_optimizer(
                 model_path=local_path,
@@ -555,6 +585,8 @@ class ActorRolloutRefWorker(Worker):
                 self.config.ref.use_fused_kernels = use_fused_kernels
             self.ref_policy = DataParallelPPOActor(config=self.config.ref, actor_module=self.ref_module_fsdp)
 
+            tp.end()
+
         if self._is_actor:
             self.flops_counter = FlopsCounter(self.actor_model_config)
             self.checkpoint_manager = FSDPCheckpointManager(
@@ -567,20 +599,34 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
+        update_actor_tp = TracePoint("update-actor", "FSDPWorker")
+        update_actor_tp.begin()
         # Support all hardwares
         data = data.to(get_torch_device().current_device())
 
         assert self._is_actor
         if self._is_offload_param:
+            tp = TracePoint("load-model", "FSDPWorker")
+            tp.begin()
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            tp.end()
         if self._is_offload_optimizer:
+            tp = TracePoint("load-optimizer", "FSDPWorker")
+            tp.begin()
             load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_torch_device().current_device())
+            tp.end()
 
         with self.ulysses_sharding_manager:
+            tp = TracePoint("preprocess-data", "FSDPWorker")
+            tp.begin()
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
+            tp.end()
             # perform training
             with Timer(name="update_policy", logger=None) as timer:
+                tp = TracePoint("update-policy", "FSDPWorker")
+                tp.begin()
                 metrics = self.actor.update_policy(data=data)
+                tp.end()
             delta_time = timer.last
             global_num_tokens = data.meta_info["global_token_num"]
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
@@ -596,20 +642,32 @@ class ActorRolloutRefWorker(Worker):
             # TODO: here, we should return all metrics
             output = DataProto(meta_info={"metrics": metrics})
 
+            tp = TracePoint("postprocess-data", "FSDPWorker")
+            tp.begin()
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
+            tp.end()
             output = output.to("cpu")
 
         if self._is_offload_param:
+            tp = TracePoint("offload-model", "FSDPWorker")
+            tp.begin()
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
             log_gpu_memory_usage("After offload actor model during update_actor", logger=logger)
+            tp.end()
         if self._is_offload_optimizer:
+            tp = TracePoint("offload-optimizer", "FSDPWorker")
+            tp.begin()
             offload_fsdp_optimizer(optimizer=self.actor_optimizer)
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
+            tp.end()
 
+        update_actor_tp.end()
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
+        rollout_tp = TracePoint("rollout", "FSDPWorker")
+        rollout_tp.begin()
         # Support all hardwares
         prompts = prompts.to(get_torch_device().current_device())
 
@@ -623,26 +681,42 @@ class ActorRolloutRefWorker(Worker):
         with self.rollout_sharding_manager:
             log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
 
+            tp = TracePoint("preprocess-data", "FSDPWorker")
+            tp.begin()
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
+            tp.end()
+
+            tp = TracePoint("vllm-gen", "FSDPWorker")
+            tp.begin()
             output = self.rollout.generate_sequences(prompts=prompts)
+            tp.end()
 
             log_gpu_memory_usage("After rollout generation", logger=logger)
 
+            tp = TracePoint("postprocess-data", "FSDPWorker")
+            tp.begin()
             output = self.rollout_sharding_manager.postprocess_data(output)
+            tp.end()
 
         output = output.to("cpu")
 
         # clear kv cache
         get_torch_device().empty_cache()
+        rollout_tp.end()
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_log_prob(self, data: DataProto):
         # when is_lora is True, we use the actor without lora applied to calculate the log_prob
         # which is mostly used for ref log_prob calculation
+        c_tp = TracePoint("compute-log-prob", "FSDPWorker")
+        c_tp.begin()
         assert self._is_actor
         if self._is_offload_param:
+            tp = TracePoint("load-model", "FSDPWorker")
+            tp.begin()
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            tp.end()
 
         # Support all hardwares
         from contextlib import nullcontext
@@ -657,14 +731,25 @@ class ActorRolloutRefWorker(Worker):
         data.meta_info["temperature"] = self.config.rollout.temperature
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
+            tp = TracePoint("preprocess-data", "FSDPWorker")
+            tp.begin()
             data = self.ulysses_sharding_manager.preprocess_data(data)
+            tp.end()
+
+            tp = TracePoint("compute", "FSDPWorker")
+            tp.begin()
             with adapter_ctx:
                 output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+            tp.end()
+
+            tp = TracePoint("postprocess-data", "FSDPWorker")
+            tp.begin()
             output = DataProto.from_dict(
                 tensors={"old_log_probs": output, "entropys": entropys},
                 meta_info={"temperature": self.config.rollout.temperature},
             )
             output = self.ulysses_sharding_manager.postprocess_data(output)
+            tp.end()
 
         output = output.to("cpu")
 
@@ -674,9 +759,13 @@ class ActorRolloutRefWorker(Worker):
             self.actor.actor_module._handle.reshard(True)
 
         if self._is_offload_param:
+            tp = TracePoint("offload-model", "FSDPWorker")
+            tp.begin()
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
             log_gpu_memory_usage("After offload actor model during compute_log_prob", logger=logger)
+            tp.end()
 
+        c_tp.end()
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -757,21 +846,36 @@ class ActorRolloutRefWorker(Worker):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
         if self._is_offload_param:
+            tp = TracePoint("load-actor", "FSDPWorker")
+            tp.begin()
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            tp.end()
 
+        tp = TracePoint("load-ckpt")
+        tp.begin()
         self.checkpoint_manager.load_checkpoint(local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load)
+        tp.end()
 
         if self._is_offload_param:
+            tp = TracePoint("offload-actor", "FSDPWorker")
+            tp.begin()
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            tp.end()
 
         if self._is_offload_optimizer:
+            tp = TracePoint("offload-optimizer", "FSDPWorker")
+            tp.begin()
             offload_fsdp_optimizer(self.actor_optimizer)
+            tp.end()
 
 
 class CriticWorker(Worker):
     def __init__(self, config):
         super().__init__()
         import torch.distributed
+
+        tp = TracePoint("init-for-critic", "FSDPWorker")
+        tp.begin()
 
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(backend="nccl" if is_cuda_available else "hccl")
@@ -809,6 +913,8 @@ class CriticWorker(Worker):
             assert self.config.ppo_mini_batch_size % self.config.ppo_micro_batch_size_per_gpu == 0, f"normalized ppo_mini_batch_size {self.config.ppo_mini_batch_size} should be divisible by ppo_micro_batch_size_per_gpu {self.config.ppo_micro_batch_size_per_gpu}"
             assert self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu > 0, f"normalized ppo_mini_batch_size {self.config.ppo_mini_batch_size} should be larger than ppo_micro_batch_size_per_gpu {self.config.ppo_micro_batch_size_per_gpu}"
         self._is_lora = self.config.model.get("lora_rank", 0) > 0
+
+        tp.end()
 
     def _build_critic_model_optimizer(self, config):
         # the following line is necessary
@@ -992,14 +1098,23 @@ class CriticWorker(Worker):
 
         from verl.workers.critic import DataParallelPPOCritic
 
+        tp = TracePoint("build-critic", "FSDPWorker")
+        tp.begin()
         self.critic_module, self.critic_optimizer, self.critic_lr_scheduler = self._build_critic_model_optimizer(self.config)
+        tp.end()
 
         if self._is_offload_param:
+            tp = TracePoint("offload-critic", "FSDPWorker")
+            tp.begin()
             offload_fsdp_model_to_cpu(self.critic_module)
             log_gpu_memory_usage("After offload critic model during init", logger=logger)
+            tp.end()
         if self._is_offload_optimizer:
+            tp = TracePoint("offload-optimizer", "FSDPWorker")
+            tp.begin()
             offload_fsdp_optimizer(optimizer=self.critic_optimizer)
             log_gpu_memory_usage("After offload critic optimizer during init", logger=logger)
+            tp.end()
 
         self.critic = DataParallelPPOCritic(config=self.config, critic_module=self.critic_module, critic_optimizer=self.critic_optimizer)
 
@@ -1014,43 +1129,78 @@ class CriticWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_values(self, data: DataProto):
+        c_tp = TracePoint("compute-values", "FSDPWorker")
+        c_tp.begin()
         # Support all hardwares
         data = data.to(get_torch_device().current_device())
 
         if self._is_offload_param:
+            tp = TracePoint("load-model", "FSDPWorker")
+            tp.begin()
             load_fsdp_model_to_gpu(self.critic_module)
+            tp.end()
+
         micro_batch_size = self.config.forward_micro_batch_size_per_gpu
         data.meta_info["micro_batch_size"] = micro_batch_size
         data.meta_info["max_token_len"] = self.config.forward_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.use_dynamic_bsz
         # perform forward computation
         with self.ulysses_sharding_manager:
+            tp = TracePoint("preprocess-data", "FSDPWorker")
+            tp.begin()
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
+            tp.end()
+
+            tp = TracePoint("compute", "FSDPWorker")
+            tp.begin()
             values = self.critic.compute_values(data=data)
+            tp.end()
+
+            tp = TracePoint("postprocess-data", "FSDPWorker")
+            tp.begin()
             output = DataProto.from_dict(tensors={"values": values})
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
+            tp.end()
 
         output = output.to("cpu")
         if self._is_offload_param:
+            tp = TracePoint("offload-model", "FSDPWorker")
+            tp.begin()
             offload_fsdp_model_to_cpu(self.critic_module)
+            tp.end()
+        c_tp.end()
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_critic(self, data: DataProto):
+        update_critic_tp = TracePoint("update-critic", "FSDPWorker")
+        update_critic_tp.begin()
         # Support all hardwares
         data = data.to(get_torch_device().current_device())
         if self._is_offload_param:
+            tp = TracePoint("load-model", "FSDPWorker")
+            tp.begin()
             load_fsdp_model_to_gpu(self.critic_module)
+            tp.end()
         if self._is_offload_optimizer:
+            tp = TracePoint("load-optimizer", "FSDPWorker")
+            tp.begin()
             load_fsdp_optimizer(optimizer=self.critic_optimizer, device_id=get_torch_device().current_device())
+            tp.end()
 
         # perform forward computation
         with self.ulysses_sharding_manager:
+            tp = TracePoint("preprocess-data", "FSDPWorker")
+            tp.begin()
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
+            tp.end()
 
+            tp = TracePoint("update-critic", "FSDPWorker")
+            tp.begin()
             with Timer(name="update_critic", logger=None) as timer:
                 metrics = self.critic.update_critic(data=data)
             delta_time = timer.last
+            tp.end()
 
             global_num_tokens = data.meta_info["global_token_num"]
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
@@ -1061,14 +1211,24 @@ class CriticWorker(Worker):
             metrics["critic/lr"] = lr
 
             output = DataProto(batch=None, meta_info={"metrics": metrics})
+            tp = TracePoint("postprocess-data", "FSDPWorker")
+            tp.begin()
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
+            tp.end()
 
         if self._is_offload_param:
+            tp = TracePoint("offload-model", "FSDPWorker")
+            tp.begin()
             offload_fsdp_model_to_cpu(self.critic_module)
+            tp.end()
         if self._is_offload_optimizer:
+            tp = TracePoint("offload-optimizer", "FSDPWorker")
+            tp.begin()
             offload_fsdp_optimizer(optimizer=self.critic_optimizer)
+            tp.end()
 
         output = output.to("cpu")
+        update_critic_tp.end()
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -1089,16 +1249,28 @@ class CriticWorker(Worker):
         import torch
 
         if self._is_offload_param:
+            tp = TracePoint("load-critic", "FSDPWorker")
+            tp.begin()
             load_fsdp_model_to_gpu(self.critic_module)
+            tp.end()
 
+        tp = TracePoint("load-ckpt", "FSDPWorker")
+        tp.begin()
         self.checkpoint_manager.load_checkpoint(local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load)
+        tp.end()
 
         torch.distributed.barrier()
         if self._is_offload_param:
+            tp = TracePoint("offload-critic", "FSDPWorker")
+            tp.begin()
             offload_fsdp_model_to_cpu(self.critic_module)
+            tp.end()
 
         if self._is_offload_optimizer:
+            tp = TracePoint("offload-optimizer", "FSDPWorker")
+            tp.begin()
             offload_fsdp_optimizer(self.critic_optimizer)
+            tp.end()
 
 
 # TODO(sgm): we may need to extract it to dp_reward_model.py
