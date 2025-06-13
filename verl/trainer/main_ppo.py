@@ -50,6 +50,9 @@ class TaskRunner:
         from pprint import pprint
 
         from omegaconf import OmegaConf
+        from vtimeline import TracePoint, vinit
+
+        vinit()
 
         from verl.utils.fs import copy_to_local
 
@@ -57,14 +60,20 @@ class TaskRunner:
         OmegaConf.resolve(config)
 
         # download the checkpoint from hdfs
+        tp = TracePoint("m-copy-ckpt", "Trainer")
+        tp.begin()
         local_path = copy_to_local(config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False))
+        tp.end()
 
         # instantiate tokenizer
         from verl.utils import hf_processor, hf_tokenizer
 
+        tp = TracePoint("m-load-tokenizer", "Trainer")
+        tp.begin()
         trust_remote_code = config.data.get("trust_remote_code", False)
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
         processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)  # used for multimodal LLM, could be none
+        tp.end()
 
         # vllm early verify
         if config.actor_rollout_ref.rollout.name in ["vllm"]:
@@ -117,6 +126,8 @@ class TaskRunner:
         # - finally, we combine all the rewards together
         # - The reward type depends on the tag of the data
         if config.reward_model.enable:
+            tp = TracePoint("m-init-reword", "Trainer")
+            tp.begin()
             if config.reward_model.strategy in ["fsdp", "fsdp2"]:
                 from verl.workers.fsdp_workers import RewardModelWorker
             elif config.reward_model.strategy == "megatron":
@@ -125,11 +136,15 @@ class TaskRunner:
                 raise NotImplementedError
             role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
             mapping[Role.RewardModel] = global_pool_id
+            tp.end()
 
         # use reference model
         if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
+            tp = TracePoint("m-init-ref", "Trainer")
+            tp.begin()
             role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
             mapping[Role.RefPolicy] = global_pool_id
+            tp.end()
 
         reward_fn = load_reward_manager(config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {}))
         val_reward_fn = load_reward_manager(config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {}))
@@ -137,9 +152,13 @@ class TaskRunner:
 
         from verl.utils.dataset.rl_dataset import collate_fn
 
+        tp = TracePoint("m-create-dataset", "Trainer")
+        tp.begin()
         train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor)
         val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor)
         train_sampler = create_rl_sampler(config.data, train_dataset)
+        tp.end()
+
         trainer = RayPPOTrainer(
             config=config,
             tokenizer=tokenizer,
