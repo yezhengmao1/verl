@@ -101,10 +101,18 @@ class ActorRolloutRefWorker(Worker):
         super().__init__()
         self.config = config
         import torch.distributed
+        from vtimeline import TracePoint, VLogger, tracepoint_module_setup
+
+        tracepoint_module_setup()
+
+        tp = TracePoint(f"init-for-{role}", "FSDPWorker")
+        tp.begin()
 
         if not torch.distributed.is_initialized():
             rank = int(os.environ.get("RANK", 0))
             world_size = int(os.environ.get("WORLD_SIZE", 1))
+
+            VLogger.info(f"Init torch distributed env for {role}, rank is {rank} / {world_size}")
             torch.distributed.init_process_group(backend="cpu:gloo,cuda:nccl" if is_cuda_available else "cpu:gloo,npu:hccl", rank=rank, world_size=world_size)
 
         # build device mesh for FSDP
@@ -161,6 +169,8 @@ class ActorRolloutRefWorker(Worker):
         if self._is_ref and self.config.ref.log_prob_micro_batch_size is not None:
             self.config.ref.log_prob_micro_batch_size //= self.device_mesh.size() // self.ulysses_sequence_parallel_size
             self.config.ref.log_prob_micro_batch_size_per_gpu = self.config.ref.log_prob_micro_batch_size
+
+        tp.end()
 
     def _build_model_optimizer(
         self,
@@ -478,6 +488,7 @@ class ActorRolloutRefWorker(Worker):
         import_external_libs(self.config.model.get("external_lib", None))
 
         from omegaconf import OmegaConf
+        from vtimeline import TracePoint  # do need to init it
 
         override_model_config = OmegaConf.to_container(self.config.model.get("override_config", OmegaConf.create()))
 
@@ -487,6 +498,9 @@ class ActorRolloutRefWorker(Worker):
 
         if self._is_actor or self._is_rollout:
             # we need the model for actor and rollout
+            tp = TracePoint("load-model-for-actor-and-rollout", "FSDPWorker")
+            tp.begin()
+
             if self._is_actor:
                 optim_config = self.config.actor.optim
                 fsdp_config = self.config.actor.fsdp_config
@@ -519,12 +533,23 @@ class ActorRolloutRefWorker(Worker):
                 self.actor_module = self.actor_module_fsdp._fsdp_wrapped_module
 
             if self._is_offload_param:
+                offload_tp = TracePoint("offload-param", "FSDPWorker")
+                offload_tp.begin()
                 offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+                offload_tp.end()
+
                 log_gpu_memory_usage("After offload actor model during init", logger=logger)
 
             if self._is_offload_optimizer:
+                offload_tp = TracePoint("offload-optimizer", "FSDPWorker")
+                offload_tp.begin()
                 offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+                offload_tp.end()
+
                 log_gpu_memory_usage("After offload actor optimizer during init", logger=logger)
+
+            tp.end()
+
         # load from checkpoint
         if self._is_actor:
             OmegaConf.set_struct(self.config.actor, True)
@@ -534,9 +559,15 @@ class ActorRolloutRefWorker(Worker):
             self.actor = DataParallelPPOActor(config=self.config.actor, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer)
 
         if self._is_rollout:
+            tp = TracePoint("build-rollout", "FSDPWorker")
+            tp.begin()
             self.rollout, self.rollout_sharding_manager = self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
+            tp.end()
 
         if self._is_ref:
+            tp = TracePoint("build-ref-optimizer", "FSDPWorker")
+            tp.begin()
+
             local_path = copy_to_local(self.config.model.path, use_shm=use_shm)
             self.ref_module_fsdp = self._build_model_optimizer(
                 model_path=local_path,
@@ -554,6 +585,8 @@ class ActorRolloutRefWorker(Worker):
                 self.config.ref.use_remove_padding = use_remove_padding
                 self.config.ref.use_fused_kernels = use_fused_kernels
             self.ref_policy = DataParallelPPOActor(config=self.config.ref, actor_module=self.ref_module_fsdp)
+
+            tp.end()
 
         if self._is_actor:
             self.flops_counter = FlopsCounter(self.actor_model_config)
@@ -772,6 +805,10 @@ class CriticWorker(Worker):
     def __init__(self, config):
         super().__init__()
         import torch.distributed
+        from vtimeline import TracePoint
+
+        tp = TracePoint("init-for-critic", "FSDPWorker")
+        tp.begin()
 
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(backend="nccl" if is_cuda_available else "hccl")
@@ -809,6 +846,8 @@ class CriticWorker(Worker):
             assert self.config.ppo_mini_batch_size % self.config.ppo_micro_batch_size_per_gpu == 0, f"normalized ppo_mini_batch_size {self.config.ppo_mini_batch_size} should be divisible by ppo_micro_batch_size_per_gpu {self.config.ppo_micro_batch_size_per_gpu}"
             assert self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu > 0, f"normalized ppo_mini_batch_size {self.config.ppo_mini_batch_size} should be larger than ppo_micro_batch_size_per_gpu {self.config.ppo_micro_batch_size_per_gpu}"
         self._is_lora = self.config.model.get("lora_rank", 0) > 0
+
+        tp.end()
 
     def _build_critic_model_optimizer(self, config):
         # the following line is necessary
@@ -990,16 +1029,27 @@ class CriticWorker(Worker):
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
 
+        from vtimeline import TracePoint
+
         from verl.workers.critic import DataParallelPPOCritic
 
+        tp = TracePoint("build-critic-model", "FSDPWorker")
+        tp.begin()
         self.critic_module, self.critic_optimizer, self.critic_lr_scheduler = self._build_critic_model_optimizer(self.config)
+        tp.end()
 
         if self._is_offload_param:
+            tp = TracePoint("offload-critic_module", "FSDPWorker")
+            tp.begin()
             offload_fsdp_model_to_cpu(self.critic_module)
             log_gpu_memory_usage("After offload critic model during init", logger=logger)
+            tp.end()
         if self._is_offload_optimizer:
+            tp = TracePoint("offload-critic_optimizer", "FSDPWorker")
+            tp.begin()
             offload_fsdp_optimizer(optimizer=self.critic_optimizer)
             log_gpu_memory_usage("After offload critic optimizer during init", logger=logger)
+            tp.end()
 
         self.critic = DataParallelPPOCritic(config=self.config, critic_module=self.critic_module, critic_optimizer=self.critic_optimizer)
 

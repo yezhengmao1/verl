@@ -50,6 +50,9 @@ class TaskRunner:
         from pprint import pprint
 
         from omegaconf import OmegaConf
+        from vtimeline import TracePoint, tracepoint_module_setup
+
+        tracepoint_module_setup()
 
         from verl.utils.fs import copy_to_local
 
@@ -57,14 +60,20 @@ class TaskRunner:
         OmegaConf.resolve(config)
 
         # download the checkpoint from hdfs
+        tp = TracePoint("copy-ckpt", "Run")
+        tp.begin()
         local_path = copy_to_local(config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False))
+        tp.end()
 
         # instantiate tokenizer
         from verl.utils import hf_processor, hf_tokenizer
 
+        tp = TracePoint("load-tokenizer", "Run")
+        tp.begin()
         trust_remote_code = config.data.get("trust_remote_code", False)
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
         processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)  # used for multimodal LLM, could be none
+        tp.end()
 
         # vllm early verify
         if config.actor_rollout_ref.rollout.name in ["vllm"]:
