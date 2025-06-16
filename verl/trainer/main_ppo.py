@@ -20,20 +20,25 @@ import ray
 
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.reward import load_reward_manager
+from vtimeline import TracePoint, VLogger, tracepoint_module_setup
+
+tracepoint_module_setup()
 
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
 def main(config):
     run_ppo(config)
 
-
 def run_ppo(config) -> None:
     if not ray.is_initialized():
         # this is for local ray cluster
+        tp = TracePoint("ray-init", "Other")
+        tp.begin()
         ray.init(
             runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_LOGGING_LEVEL": "WARN", "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true"}},
             num_cpus=config.ray_init.num_cpus,
         )
+        tp.end()
 
     runner = TaskRunner.remote()
     ray.get(runner.run.remote(config))
@@ -50,17 +55,16 @@ class TaskRunner:
         from pprint import pprint
 
         from omegaconf import OmegaConf
-        from vtimeline import TracePoint, tracepoint_module_setup
-
-        tracepoint_module_setup()
 
         from verl.utils.fs import copy_to_local
 
         pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
         OmegaConf.resolve(config)
+        
+        VLogger.info(f"Omegaconf: {OmegaConf.to_container(config, resolve=True)}")
 
         # download the checkpoint from hdfs
-        tp = TracePoint("copy-ckpt", "Run")
+        tp = TracePoint("copy-ckpt", "Download")
         tp.begin()
         local_path = copy_to_local(config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False))
         tp.end()
@@ -68,7 +72,7 @@ class TaskRunner:
         # instantiate tokenizer
         from verl.utils import hf_processor, hf_tokenizer
 
-        tp = TracePoint("load-tokenizer", "Run")
+        tp = TracePoint("load-tokenizer", "Download")
         tp.begin()
         trust_remote_code = config.data.get("trust_remote_code", False)
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
@@ -77,13 +81,18 @@ class TaskRunner:
 
         # vllm early verify
         if config.actor_rollout_ref.rollout.name in ["vllm"]:
+            tp = TracePoint("vllm-early-verify", "Run")
+            tp.begin()
             from verl.utils.vllm_utils import is_version_ge
 
             if config.actor_rollout_ref.model.get("lora_rank", 0) > 0:
                 if not is_version_ge(pkg="vllm", minver="0.7.3"):
                     raise NotImplementedError("PPO LoRA is not supported before vllm 0.7.3")
+            tp.end() 
 
         # define worker classes
+        tp = TracePoint("define-actor-and-rollout-worker", "Worker")
+        tp.begin()
         if config.actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"]:
             assert config.critic.strategy in ["fsdp", "fsdp2"]
             from verl.single_controller.ray import RayWorkerGroup
@@ -102,14 +111,20 @@ class TaskRunner:
 
         else:
             raise NotImplementedError
+        tp.end()
 
         from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
 
+        tp = TracePoint("role-worker-mapping", "Worker")
+        tp.begin()
         role_worker_mapping = {
             Role.ActorRollout: ray.remote(actor_rollout_cls),
             Role.Critic: ray.remote(CriticWorker),
         }
+        tp.end()
 
+        tp = TracePoint("define-resource-pool-and-map-worker2poll", "Resource")
+        tp.begin()
         global_pool_id = "global_pool"
         resource_pool_spec = {
             global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
@@ -118,6 +133,7 @@ class TaskRunner:
             Role.ActorRollout: global_pool_id,
             Role.Critic: global_pool_id,
         }
+        tp.end()
 
         # we should adopt a multi-source reward function here
         # - for rule-based rm, we directly call a reward score
@@ -126,6 +142,8 @@ class TaskRunner:
         # - finally, we combine all the rewards together
         # - The reward type depends on the tag of the data
         if config.reward_model.enable:
+            tp = TracePoint("define-reward-worker", "Worker")
+            tp.begin()
             if config.reward_model.strategy in ["fsdp", "fsdp2"]:
                 from verl.workers.fsdp_workers import RewardModelWorker
             elif config.reward_model.strategy == "megatron":
@@ -134,21 +152,38 @@ class TaskRunner:
                 raise NotImplementedError
             role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
             mapping[Role.RewardModel] = global_pool_id
+            tp.end()
 
         # use reference model
         if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
+            tp = TracePoint("define-ref-worker", "Worker")
+            tp.begin()
             role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
             mapping[Role.RefPolicy] = global_pool_id
-
+            tp.end()
+        
+        tp = TracePoint("load-reward-manager", "Other")
+        tp.begin()
         reward_fn = load_reward_manager(config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {}))
         val_reward_fn = load_reward_manager(config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {}))
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
+        tp.end()
 
         from verl.utils.dataset.rl_dataset import collate_fn
 
+        tp = TracePoint("create-dataset-and-sampler", "Dataset")
+        tp.begin()
         train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor)
         val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor)
+        tp.end()
+
+        tp = TracePoint("create-rl-sampler", "Run")
+        tp.begin()
         train_sampler = create_rl_sampler(config.data, train_dataset)
+        tp.end()
+        
+        tp = TracePoint("create-ppo-trainer", "Other")
+        tp.begin()
         trainer = RayPPOTrainer(
             config=config,
             tokenizer=tokenizer,
@@ -164,8 +199,17 @@ class TaskRunner:
             train_sampler=train_sampler,
             device_name=config.trainer.device,
         )
+        tp.end()
+
+        tp = TracePoint("init-workers", "Worker")
+        tp.begin()
         trainer.init_workers()
+        tp.end()
+
+        tp = TracePoint("fit-ppo", "Run")
+        tp.begin()
         trainer.fit()
+        tp.end()
 
 
 def create_rl_dataset(data_paths, data_config, tokenizer, processor):
