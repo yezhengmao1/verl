@@ -41,6 +41,11 @@ from vllm import LLM, SamplingParams
 from vllm.distributed import parallel_state as vllm_ps
 from vllm.lora.request import LoRARequest
 from vllm.worker.worker_base import WorkerWrapperBase
+from vtimeline import TracePoint, VLogger, tracepoint_module_setup
+
+tracepoint_module_setup()
+
+
 
 from verl import DataProto
 from verl.third_party.vllm import vllm_version
@@ -213,6 +218,8 @@ class vLLMRollout(BaseRollout):
     @GPUMemoryLogger(role="vllm rollout spmd", logger=logger)
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
+        tp = TracePoint("vllm-generate-sequences", "Other")
+        tp.begin()
         # rebuild vllm cache engine
         if (
             vllm_version
@@ -360,6 +367,7 @@ class vLLMRollout(BaseRollout):
         ):
             self.inference_engine.free_cache_engine()
 
+        tp.end()
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 
 

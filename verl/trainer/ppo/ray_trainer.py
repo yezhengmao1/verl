@@ -37,7 +37,9 @@ from omegaconf import OmegaConf, open_dict
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
-from vtimeline import TracePoint, VLogger
+from vtimeline import TracePoint, VLogger, tracepoint_module_setup
+
+tracepoint_module_setup()
 
 from verl import DataProto
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
@@ -369,7 +371,6 @@ class RayPPOTrainer:
         device_name="cuda",
     ):
         """Initialize distributed PPO trainer with Ray backend."""
-
         self.tokenizer = tokenizer
         self.processor = processor
         self.config = config
@@ -381,8 +382,6 @@ class RayPPOTrainer:
 
         if self.hybrid_engine:
             assert Role.ActorRollout in role_worker_mapping, f"{role_worker_mapping.keys()=}"
-
-        VLogger.info(f"Roles : {[role.name for role in role_worker_mapping.keys()]}")
 
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
@@ -415,8 +414,14 @@ class RayPPOTrainer:
         else:
             raise NotImplementedError
 
+        tp = TracePoint("check-config-for-trainer ", "Other")
+        tp.begin()
         self._validate_config()
+        tp.end()
+        tp = TracePoint("create-dataloader", "Other")
+        tp.begin()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+        tp.end()
 
     def _validate_config(self):
         config = self.config
@@ -659,17 +664,27 @@ class RayPPOTrainer:
         sample_inputs = []
         sample_outputs = []
         sample_scores = []
-
+        idx = 0
+        tp = TracePoint("test-one-time-process", "Test")
+        tp.begin()
         for test_data in self.val_dataloader:
+            pp1 = TracePoint(f"get-data", "Test")
+            if idx == 0: pp1.begin()
             test_batch = DataProto.from_single_dict(test_data)
+            if idx == 0: pp1.end()
 
+            pp2 = TracePoint(f"repeat-rollout-data", "Test")
+            if idx == 0: pp2.begin()
             # repeat test batch
             test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True)
+            if idx == 0: pp2.end()
 
             # we only do validation on rule-based rm
             if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
                 return {}
 
+            pp3 = TracePoint(f"process-data", "Test")
+            if idx == 0: pp3.begin()
             # Store original inputs
             input_ids = test_batch.batch["input_ids"]
             # TODO: Can we keep special tokens except for padding tokens?
@@ -700,8 +715,12 @@ class RayPPOTrainer:
 
             # pad to be divisible by dp_size
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
+            if idx == 0: pp3.end()
             if not self.async_rollout_mode:
+                pp4 = TracePoint(f"generate-sequences", "Test")
+                if idx == 0: pp4.begin()
                 test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+                if idx == 0: pp4.end()
             else:
                 self.async_rollout_manager.wake_up()
                 test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
@@ -730,7 +749,7 @@ class RayPPOTrainer:
                     reward_extra_infos_dict[key].extend(lst)
 
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
-
+            if idx == 0: idx+=1
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
         # dump generations
@@ -762,7 +781,7 @@ class RayPPOTrainer:
                         metric_sec = "val-aux"
                     pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
                     metric_dict[pfx] = metric_val
-
+        tp = tp.end()
         return metric_dict
 
     def init_workers(self):
@@ -772,8 +791,10 @@ class RayPPOTrainer:
         1. Ray resource pools from configuration
         2. Worker groups for each role (actor, critic, etc.)
         """
+        tp = TracePoint("create-ray-resource-pool", "Other")
+        tp.begin()
         self.resource_pool_manager.create_resource_pool()
-
+        tp.end()
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
         # create actor and rollout
@@ -966,10 +987,15 @@ class RayPPOTrainer:
         self.global_steps = 0
 
         # load checkpoint before doing anything
+        tp = TracePoint("load checkpoint", "fit")
+        tp.begin()
         self._load_checkpoint()
+        tp.end()
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
+        tp = TracePoint("test-before-train", "Test")
+        tp.begin()
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
@@ -977,6 +1003,7 @@ class RayPPOTrainer:
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
                 return
+        tp.end()
 
         # add tqdm
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
@@ -1009,6 +1036,8 @@ class RayPPOTrainer:
 
                 with _timer("step", timing_raw):
                     # generate a batch
+                    tp = TracePoint("generate a batch", "fit function")
+                    tp.begin()
                     with _timer("gen", timing_raw):
                         if not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
@@ -1016,8 +1045,11 @@ class RayPPOTrainer:
                             self.async_rollout_manager.wake_up()
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
                             self.async_rollout_manager.sleep()
+                    tp.end()
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                        tp = TracePoint("gen_max", "fit")
+                        tp.begin()
                         with _timer("gen_max", timing_raw):
                             gen_baseline_batch = deepcopy(gen_batch)
                             gen_baseline_batch.meta_info["do_sample"] = False
@@ -1032,12 +1064,14 @@ class RayPPOTrainer:
                             batch.batch["reward_baselines"] = reward_baseline_tensor
 
                             del gen_baseline_batch, gen_baseline_output
-
+                        tp.end()
                     batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
+                    tp = TracePoint("compute_response_mask", "fit")
+                    tp.begin()
                     batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
@@ -1046,10 +1080,12 @@ class RayPPOTrainer:
                     # TODO: Decouple the DP balancing and mini-batching.
                     if self.config.trainer.balance_batch:
                         self._balance_batch(batch, metrics=metrics)
-
+                    tp.end()
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
+                    tp = TracePoint("reward", "fit")
+                    tp.begin()
                     with _timer("reward", timing_raw):
                         # compute reward model score
                         if self.use_rm:
@@ -1060,9 +1096,12 @@ class RayPPOTrainer:
                             future_reward = compute_reward_async.remote(batch, self.config, self.tokenizer)
                         else:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                    tp.end()
 
                     # recompute old_log_probs
                     with _timer("old_log_prob", timing_raw):
+                        tp = TracePoint("old_log_prob", "fit")
+                        tp.begin()
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                         entropys = old_log_prob.batch["entropys"]
                         response_masks = batch.batch["response_mask"]
@@ -1072,7 +1111,10 @@ class RayPPOTrainer:
                         metrics.update(old_log_prob_metrics)
                         old_log_prob.batch.pop("entropys")
                         batch = batch.union(old_log_prob)
+                        tp.end()
 
+                        tp = TracePoint("rollout_probs_diff", "fit")
+                        tp.begin()
                         if "rollout_log_probs" in batch.batch.keys():
                             # TODO: we may want to add diff of probs too.
                             rollout_old_log_probs = batch.batch["rollout_log_probs"]
@@ -1096,7 +1138,9 @@ class RayPPOTrainer:
                                     "training/rollout_probs_diff_std": rollout_probs_diff_std.detach().item(),
                                 }
                             )
-
+                        tp.end()
+                    tp = TracePoint("ref", "fit")
+                    tp.begin()
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with _timer("ref", timing_raw):
@@ -1105,13 +1149,19 @@ class RayPPOTrainer:
                             else:
                                 ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
+                    tp.end()
 
+                    tp = TracePoint("values", "fit")
+                    tp.begin()
                     # compute values
                     if self.use_critic:
                         with _timer("values", timing_raw):
                             values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
+                    tp.end()
 
+                    tp = TracePoint("adv", "fit")
+                    tp.begin()
                     with _timer("adv", timing_raw):
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
@@ -1146,14 +1196,20 @@ class RayPPOTrainer:
                             pf_ppo_reweight_method=self.config.algorithm.pf_ppo.reweight_method,
                             pf_ppo_weight_pow=self.config.algorithm.pf_ppo.weight_pow,
                         )
+                    tp.end()
 
+                    tp = TracePoint("update_critic", "fit")
+                    tp.begin()
                     # update critic
                     if self.use_critic:
                         with _timer("update_critic", timing_raw):
                             critic_output = self.critic_wg.update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
+                    tp.end()
 
+                    tp = TracePoint("update_actor", "fit")
+                    tp.begin()
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
@@ -1162,7 +1218,10 @@ class RayPPOTrainer:
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+                    tp.end()
 
+                    tp = TracePoint("dump_rollout_generations", "fit")
+                    tp.begin()
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
@@ -1178,7 +1237,10 @@ class RayPPOTrainer:
                                 reward_extra_infos_dict=reward_extra_infos_dict,
                                 dump_path=rollout_data_dir,
                             )
+                    tp.end()
 
+                    tp = TracePoint("validate", "fit")
+                    tp.begin()
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0):
                         with _timer("testing", timing_raw):
@@ -1186,11 +1248,17 @@ class RayPPOTrainer:
                             if is_last_step:
                                 last_val_metrics = val_metrics
                         metrics.update(val_metrics)
+                    tp.end()
 
+                    tp = TracePoint("save_checkpoint", "fit")
+                    tp.begin()
                     if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
                         with _timer("save_checkpoint", timing_raw):
                             self._save_checkpoint()
+                    tp.end()
 
+                tp = TracePoint("training_metrics", "fit")
+                tp.begin()
                 # training metrics
                 metrics.update(
                     {
@@ -1204,13 +1272,16 @@ class RayPPOTrainer:
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
-
+                tp.end()
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
 
+                tp = TracePoint("update_progress_bar", "fit")
+                tp.begin()
                 progress_bar.update(1)
                 self.global_steps += 1
                 if is_last_step:
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return
+                tp.end()

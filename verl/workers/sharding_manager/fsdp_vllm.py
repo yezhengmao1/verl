@@ -22,6 +22,10 @@ import torch
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
 from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
+from vtimeline import TracePoint, VLogger, tracepoint_module_setup
+
+tracepoint_module_setup()
+
 
 try:
     # for torch 2.5+
@@ -155,15 +159,24 @@ class FSDPVLLMShardingManager(BaseShardingManager):
 
         log_gpu_memory_usage("Before state_dict() in sharding manager memory", logger=logger)
         if self.offload_param:
+            tp = TracePoint("load-fsdp-model-in-gpu", "Other")
+            tp.begin()
             load_fsdp_model_to_gpu(self.module)
+            tp.end()
 
         peft_config = None
         peft_model = getattr(self.module, "_fsdp_wrapped_module", self.module)
         if hasattr(peft_model, "peft_config"):
+            tp = TracePoint("collect-lora-params", "Lora")
+            tp.begin()
             peft_config = peft_model.peft_config.get("default", None)
             params = __collect_lora_params()
+            tp.end()
         else:
+            tp = TracePoint("collect-params-from-gpu", "Other")
+            tp.begin()
             params = self.module.state_dict()
+            tp.end()
         log_gpu_memory_usage("After state_dict() in sharding manager memory", logger=logger)
 
         # Copy, not share memory
@@ -178,16 +191,34 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             del params
         else:
             if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
+                tp = TracePoint("vllm-wake-up", "Other")
+                tp.begin()
                 self.inference_engine.wake_up(tags=["weights"])
+                tp.end()
             else:
+                tp = TracePoint("vllm-wake-up", "Other")
+                tp.begin()
                 self.inference_engine.wake_up()
-
+                tp.end()
+            
+            tp = TracePoint("send-model-weights-to-vllm", "Other")
+            tp.begin()
             # update model params
             self.update_params(params, peft_config=peft_config)
+            tp.end()
             log_gpu_memory_usage("After sync model weights in sharding manager", logger=logger)
+            
+
+            tp = TracePoint("del-param-in-gpu", "Other")
+            tp.begin()
             del params
+            tp.end()
+
             if self.offload_param:
+                tp = TracePoint("offload-fsdp-model-to-cpu", "Other")
+                tp.begin()
                 offload_fsdp_model_to_cpu(self.module)
+                tp.end()
             get_torch_device().empty_cache()
 
             if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
@@ -236,7 +267,10 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         else:
             group = vllm_ps.get_tensor_model_parallel_group().device_group
 
+        tp = TracePoint("all-gather-data-proto-before-generate-sequence", "Other")
+        tp.begin()
         all_gather_data_proto(data=data, process_group=group)
+        tp.end()
         return data
 
     @GPUMemoryLogger(role="fsdp vllm sharding_manager", logger=logger)

@@ -32,6 +32,10 @@ from peft import LoraConfig, TaskType, get_peft_model
 from safetensors.torch import save_file
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from vtimeline import TracePoint, VLogger, tracepoint_module_setup
+
+tracepoint_module_setup()
+
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
@@ -101,9 +105,6 @@ class ActorRolloutRefWorker(Worker):
         super().__init__()
         self.config = config
         import torch.distributed
-        from vtimeline import TracePoint, VLogger, tracepoint_module_setup
-
-        tracepoint_module_setup()
 
         tp = TracePoint(f"init-for-{role}", "FSDPWorker")
         tp.begin()
@@ -488,7 +489,6 @@ class ActorRolloutRefWorker(Worker):
         import_external_libs(self.config.model.get("external_lib", None))
 
         from omegaconf import OmegaConf
-        from vtimeline import TracePoint  # do need to init it
 
         override_model_config = OmegaConf.to_container(self.config.model.get("override_config", OmegaConf.create()))
 
@@ -644,7 +644,10 @@ class ActorRolloutRefWorker(Worker):
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
         # Support all hardwares
+        tp = TracePoint("send-prompt-to-some-device", "Test")
+        tp.begin()
         prompts = prompts.to(get_torch_device().current_device())
+        tp.end()
 
         assert self._is_rollout
 
@@ -655,14 +658,15 @@ class ActorRolloutRefWorker(Worker):
         prompts.meta_info.update(meta_info)
         with self.rollout_sharding_manager:
             log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
-
+            tp = TracePoint("enter-rollout-sharding-manager", "Test")
+            tp.begin()
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
             output = self.rollout.generate_sequences(prompts=prompts)
 
             log_gpu_memory_usage("After rollout generation", logger=logger)
 
             output = self.rollout_sharding_manager.postprocess_data(output)
-
+            tp.end()
         output = output.to("cpu")
 
         # clear kv cache
@@ -805,7 +809,6 @@ class CriticWorker(Worker):
     def __init__(self, config):
         super().__init__()
         import torch.distributed
-        from vtimeline import TracePoint
 
         tp = TracePoint("init-for-critic", "FSDPWorker")
         tp.begin()
@@ -1029,7 +1032,6 @@ class CriticWorker(Worker):
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
 
-        from vtimeline import TracePoint
 
         from verl.workers.critic import DataParallelPPOCritic
 
