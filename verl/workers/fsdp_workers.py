@@ -1186,6 +1186,7 @@ class CriticWorker(Worker):
         if self._is_offload_optimizer:
             load_fsdp_optimizer(optimizer=self.critic_optimizer, device_id=get_torch_device().current_device())
         tp.end()
+        
         # perform forward computation
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
