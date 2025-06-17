@@ -551,12 +551,15 @@ class ActorRolloutRefWorker(Worker):
 
         # load from checkpoint
         if self._is_actor:
+            tp = TracePoint("build-actor", "FSDPWorker")
+            tp.begin()
             OmegaConf.set_struct(self.config.actor, True)
             with open_dict(self.config.actor):
                 self.config.actor.use_remove_padding = use_remove_padding
                 self.config.actor.use_fused_kernels = use_fused_kernels
             self.actor = DataParallelPPOActor(config=self.config.actor, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer)
-
+            tp.end()
+            
         if self._is_rollout:
             tp = TracePoint("build-rollout", "FSDPWorker")
             tp.begin()

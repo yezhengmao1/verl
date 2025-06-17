@@ -25,6 +25,7 @@ from flash_attn.bert_padding import (index_first_axis, pad_input, rearrange,
                                      unpad_input)
 from torch import nn, optim
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from vtimeline import TracePoint, VLogger, vinit
 
 from verl import DataProto
 from verl.trainer.ppo import core_algos
@@ -54,6 +55,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 class DataParallelPPOCritic(BasePPOCritic):
     def __init__(self, config, critic_module: nn.Module, critic_optimizer: optim.Optimizer):
         super().__init__(config=config)
+        vinit()
         self.critic_module = critic_module
         self.critic_optimizer = critic_optimizer
         self.use_remove_padding = self.config.model.get("use_remove_padding", False)
@@ -142,6 +144,8 @@ class DataParallelPPOCritic(BasePPOCritic):
     @GPUMemoryLogger(role="dp critic", logger=logger)
     def compute_values(self, data: DataProto) -> torch.Tensor:
         self.critic_module.eval()
+        tp = TracePoint("preprocess-data", "Actor")
+        tp.begin()
         micro_batch_size = data.meta_info["micro_batch_size"]
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
         batch = data.select(batch_keys=select_keys).batch
@@ -158,15 +162,23 @@ class DataParallelPPOCritic(BasePPOCritic):
             micro_batches, indices = rearrange_micro_batches(batch=batch, max_token_len=max_token_len)
         else:
             micro_batches = batch.split(micro_batch_size)
-
+        tp.end()
         values_lst = []
+        micro_idx = 0
         for micro_batch in micro_batches:
+            tp = TracePoint(f"forward-micro-batch-{micro_idx}", "Critic")
+            tp.begin()
             if isinstance(micro_batch, DataProto):
                 micro_batch = {**micro_batch.batch, **micro_batch.non_tensor_batch}
 
             with torch.no_grad():
                 values = self._forward_micro_batch(micro_batch)
             values_lst.append(values)
+            tp.end()
+            micro_idx += 1
+
+        tp = TracePoint("postprocess-data", "Critic")
+        tp.begin()
         values = torch.concat(values_lst, dim=0)
 
         if use_dynamic_bsz:
@@ -180,6 +192,7 @@ class DataParallelPPOCritic(BasePPOCritic):
         response_length = responses.size(1)
         response_mask = attention_mask[:, -response_length:]
         values = values * response_mask # Only action tokens have values
+        tp.end()
         return values
 
     @GPUMemoryLogger(role="dp critic", logger=logger)
