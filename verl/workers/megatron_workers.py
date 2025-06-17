@@ -45,6 +45,7 @@ from verl.utils.model import load_mcore_dist_weights, load_megatron_gptmodel_wei
 from verl.workers.actor.megatron_actor import MegatronPPOActor
 from verl.workers.critic.megatron_critic import MegatronPPOCritic
 from verl.workers.reward_model.megatron.reward_model import MegatronRewardModel
+from vtimeline import TracePoint, VLogger, vinit
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -410,35 +411,59 @@ class ActorRolloutRefWorker(MegatronWorker):
     @GPUMemoryLogger(role="update_actor", logger=logger)
     def update_actor(self, data: DataProto):
         assert self._is_actor
+        tp = TracePoint("load-model", "MegatronWorker")
+        tp.begin()
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor_module)
             log_gpu_memory_usage("After load actor params and grad during update_actor", logger=logger)
+        tp.end()
+
+        tp = TracePoint("load-optimizer", "MegatronWorker")
+        tp.begin()
         if self._is_offload_optimizer:
             load_megatron_optimizer(self.actor_optimizer)
             log_gpu_memory_usage("After load actor optimizer during update_actor", logger=logger)
+        tp.end()
+
+        tp = TracePoint("data-to-device", "MegatronWorker")
+        tp.begin()
         data.batch = data.batch.cuda()
+        tp.end()
 
         micro_batch_size = self.config.actor.ppo_micro_batch_size_per_gpu
         data.meta_info["micro_batch_size"] = micro_batch_size
         dataloader = self.actor.make_minibatch_iterator(data=data)
+        tp = TracePoint("make-dataloader", "MegatronWorker")
+        tp.begin()
         with Timer(name="update_policy", logger=None) as timer:
             metrics = self.actor.update_policy(dataloader=dataloader)
         delta_time = timer.last
         global_num_tokens = data.meta_info["global_token_num"]
         estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
         metrics["perf/mfu/actor"] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
+        tp.end()
 
+        tp = TracePoint("update-actor", "MegatronWorker")
+        tp.begin()
         # TODO: here, we should return all metrics
         output = DataProto(meta_info={"metrics": metrics})
         output = output.to("cpu")
+        tp.end()
 
+        tp = TracePoint("offload-model", "MegatronWorker")
+        tp.begin()
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor_module)
             log_gpu_memory_usage("After offload actor params and grad during update_actor", logger=logger)
         if self._is_offload_optimizer:
             offload_megatron_optimizer(self.actor_optimizer)
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
+        tp.end()
 
+        tp = TracePoint("data-to-cpu", "MegatronWorker")
+        tp.begin()  
+        output = output.to("cpu")
+        tp.end()
         torch.cuda.empty_cache()
         return output
 
@@ -752,14 +777,26 @@ class CriticWorker(MegatronWorker):
 
     @register(dispatch_mode=Dispatch.MEGATRON_COMPUTE_PROTO)
     def update_critic(self, data: DataProto):
+        tp = TracePoint("data-to-device", "MegatronWorker")
+        tp.begin()
         data = data.to(torch.cuda.current_device())
+        tp.end()
 
+        tp = TracePoint("load-model", "MegatronWorker")
+        tp.begin()
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.critic_module)
         if self._is_offload_optimizer:
             load_megatron_optimizer(self.critic_optimizer)
+        tp.end()
 
+        tp = TracePoint("make-dataloader", "MegatronWorker")
+        tp.begin()
         dataloader = self.critic.make_minibatch_iterator(data)
+        tp.end()
+
+        tp = TracePoint("update-critic", "MegatronWorker")
+        tp.begin()
         with Timer(name="update_critic", logger=None) as timer:
             metrics = self.critic.update_critic(dataloader=dataloader)
         delta_time = timer.last
@@ -767,12 +804,20 @@ class CriticWorker(MegatronWorker):
         estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
         metrics["perf/mfu/critic"] = estimated_flops * self.config.ppo_epochs / promised_flops / self.world_size
         output = DataProto(batch=None, meta_info={"metrics": metrics})
+        tp.end()
 
+        tp = TracePoint("offload-model", "MegatronWorker")
+        tp.begin()
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.critic_module)
         if self._is_offload_optimizer:
             offload_megatron_optimizer(self.critic_optimizer)
+        tp.end()
+
+        tp = TracePoint("data-to-cpu", "MegatronWorker")
+        tp.begin()
         output = output.to("cpu")
+        tp.end()
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
