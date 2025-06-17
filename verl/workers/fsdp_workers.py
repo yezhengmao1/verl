@@ -642,6 +642,7 @@ class ActorRolloutRefWorker(Worker):
             metrics["actor/lr"] = lr
             self.actor_lr_scheduler.step()
             tp.end()
+            
             # TODO: here, we should return all metrics
             output = DataProto(meta_info={"metrics": metrics})
 
