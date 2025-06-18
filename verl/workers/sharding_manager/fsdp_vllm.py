@@ -156,7 +156,8 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         #
         # pytorch: https://pytorch.org/docs/stable/notes/cuda.html#memory-management
         # vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/device_allocator/cumem.py#L103
-        get_torch_device().empty_cache()
+        with TracePoint("empty-cache", "FSDPWorker"):
+            get_torch_device().empty_cache()
 
         log_gpu_memory_usage("Before state_dict() in sharding manager memory", logger=logger)
         if self.offload_param:
@@ -165,6 +166,8 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             load_fsdp_model_to_gpu(self.module)
             tp.end()
 
+        tp = TracePoint("collect-params", "FSDPWorker")
+        tp.begin()
         peft_config = None
         peft_model = getattr(self.module, "_fsdp_wrapped_module", self.module)
         if hasattr(peft_model, "peft_config"):
@@ -173,6 +176,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         else:
             params = self.module.state_dict()
         log_gpu_memory_usage("After state_dict() in sharding manager memory", logger=logger)
+        tp.end()
 
         # Copy, not share memory
         load_format = "hf" if self.full_params else "dtensor"
@@ -212,6 +216,8 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             self.torch_random_states = get_torch_device().get_rng_state()
             get_torch_device().set_rng_state(self.gen_random_states)
         
+        mem_tp.end()
+
         mem_tp.end()
 
     @GPUMemoryLogger(role="fsdp vllm sharding_manager", logger=logger)

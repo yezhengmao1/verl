@@ -599,20 +599,34 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
+        update_actor_tp = TracePoint("update-actor", "FSDPWorker")
+        update_actor_tp.begin()
         # Support all hardwares
         data = data.to(get_torch_device().current_device())
 
         assert self._is_actor
         if self._is_offload_param:
+            tp = TracePoint("load-model", "FSDPWorker")
+            tp.begin()
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            tp.end()
         if self._is_offload_optimizer:
+            tp = TracePoint("load-optimizer", "FSDPWorker")
+            tp.begin()
             load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_torch_device().current_device())
+            tp.end()
 
         with self.ulysses_sharding_manager:
+            tp = TracePoint("preprocess-data", "FSDPWorker")
+            tp.begin()
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
+            tp.end()
             # perform training
             with Timer(name="update_policy", logger=None) as timer:
+                tp = TracePoint("update-policy", "FSDPWorker")
+                tp.begin()
                 metrics = self.actor.update_policy(data=data)
+                tp.end()
             delta_time = timer.last
             global_num_tokens = data.meta_info["global_token_num"]
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
@@ -628,16 +642,26 @@ class ActorRolloutRefWorker(Worker):
             # TODO: here, we should return all metrics
             output = DataProto(meta_info={"metrics": metrics})
 
+            tp = TracePoint("postprocess-data", "FSDPWorker")
+            tp.begin()
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
+            tp.end()
             output = output.to("cpu")
 
         if self._is_offload_param:
+            tp = TracePoint("offload-model", "FSDPWorker")
+            tp.begin()
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
             log_gpu_memory_usage("After offload actor model during update_actor", logger=logger)
+            tp.end()
         if self._is_offload_optimizer:
+            tp = TracePoint("offload-optimizer", "FSDPWorker")
+            tp.begin()
             offload_fsdp_optimizer(optimizer=self.actor_optimizer)
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
+            tp.end()
 
+        update_actor_tp.end()
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -1149,20 +1173,34 @@ class CriticWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_critic(self, data: DataProto):
+        update_critic_tp = TracePoint("update-critic", "FSDPWorker")
+        update_critic_tp.begin()
         # Support all hardwares
         data = data.to(get_torch_device().current_device())
         if self._is_offload_param:
+            tp = TracePoint("load-model", "FSDPWorker")
+            tp.begin()
             load_fsdp_model_to_gpu(self.critic_module)
+            tp.end()
         if self._is_offload_optimizer:
+            tp = TracePoint("load-optimizer", "FSDPWorker")
+            tp.begin()
             load_fsdp_optimizer(optimizer=self.critic_optimizer, device_id=get_torch_device().current_device())
+            tp.end()
 
         # perform forward computation
         with self.ulysses_sharding_manager:
+            tp = TracePoint("preprocess-data", "FSDPWorker")
+            tp.begin()
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
+            tp.end()
 
+            tp = TracePoint("update-critic", "FSDPWorker")
+            tp.begin()
             with Timer(name="update_critic", logger=None) as timer:
                 metrics = self.critic.update_critic(data=data)
             delta_time = timer.last
+            tp.end()
 
             global_num_tokens = data.meta_info["global_token_num"]
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
@@ -1173,14 +1211,24 @@ class CriticWorker(Worker):
             metrics["critic/lr"] = lr
 
             output = DataProto(batch=None, meta_info={"metrics": metrics})
+            tp = TracePoint("postprocess-data", "FSDPWorker")
+            tp.begin()
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
+            tp.end()
 
         if self._is_offload_param:
+            tp = TracePoint("offload-model", "FSDPWorker")
+            tp.begin()
             offload_fsdp_model_to_cpu(self.critic_module)
+            tp.end()
         if self._is_offload_optimizer:
+            tp = TracePoint("offload-optimizer", "FSDPWorker")
+            tp.begin()
             offload_fsdp_optimizer(optimizer=self.critic_optimizer)
+            tp.end()
 
         output = output.to("cpu")
+        update_critic_tp.end()
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
