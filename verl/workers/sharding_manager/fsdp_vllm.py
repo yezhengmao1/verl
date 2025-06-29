@@ -215,6 +215,8 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         if self.device_mesh is not None:
             self.torch_random_states = get_torch_device().get_rng_state()
             get_torch_device().set_rng_state(self.gen_random_states)
+        
+        mem_tp.end()
 
         mem_tp.end()
 

@@ -25,6 +25,7 @@ from typing import Tuple
 import torch
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from vtimeline import TracePoint, VLogger, vinit
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
@@ -54,6 +55,7 @@ class DataParallelPPOActor(BasePPOActor):
     def __init__(self, config, actor_module: nn.Module, actor_optimizer: torch.optim.Optimizer = None):
         """When optimizer is None, it is Reference Policy"""
         super().__init__(config)
+        vinit()
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
 
@@ -272,6 +274,8 @@ class DataParallelPPOActor(BasePPOActor):
         # set to eval
         self.actor_module.eval()
 
+        tp = TracePoint("preprocess-data", "Actor")
+        tp.begin()
         micro_batch_size = data.meta_info["micro_batch_size"]
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
@@ -290,10 +294,14 @@ class DataParallelPPOActor(BasePPOActor):
             micro_batches, indices = rearrange_micro_batches(batch=batch, max_token_len=max_token_len)
         else:
             micro_batches = batch.split(micro_batch_size)
+        tp.end()
 
         log_probs_lst = []
         entropy_lst = []
+        micro_idx = 0
         for micro_batch in micro_batches:
+            tp = TracePoint(f"forward-micro-batch-{micro_idx}", "Actor")
+            tp.begin()
             if isinstance(micro_batch, DataProto):
                 micro_batch = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
@@ -301,7 +309,11 @@ class DataParallelPPOActor(BasePPOActor):
             log_probs_lst.append(log_probs)
             if calculate_entropy:
                 entropy_lst.append(entropy)
+            tp.end()
+            micro_idx += 1
 
+        tp = TracePoint("postprocess-data", "Actor")
+        tp.begin()
         log_probs = torch.concat(log_probs_lst, dim=0)
         entropys = None
         if calculate_entropy:
@@ -311,7 +323,7 @@ class DataParallelPPOActor(BasePPOActor):
             assert len(indices) == log_probs.size(0), f"{len(indices)} vs. {log_probs.size()}"
             revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
             log_probs = log_probs[revert_indices]
-
+        tp.end()
         return log_probs, entropys
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
